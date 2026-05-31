@@ -1,17 +1,97 @@
 # Weibo Multi-Agent Cross-Validation Pipeline
 
-This project has **two stages**:
+Two-stage Weibo text classifier (labels 0–6):
 
-1. **Stage 1 — Qwen initial labeling** (`classify_weibo_qwen.py`): batch-classify raw Weibo NDJSON and write a numeric `type` field (0–6) per record.
-2. **Stage 2 — Multi-agent cross-validation** (`run_pipeline.py`): reuse the Qwen `type` as `type_qwen`, then run an independent Verifier, AgreementChecker, optional Judge, and ConfidenceScorer to produce an authoritative `type_final`.
+| Stage | Script | When to use |
+|-------|--------|-------------|
+| 1 (optional) | `classify_weibo_qwen.py` | Raw NDJSON without `type` — calls Qwen to write initial labels |
+| 2 (core) | `run_pipeline.py` | NDJSON with `type` — multi-agent cross-validation → `type_final` |
 
-**The bundled dataset already includes Qwen labels** (e.g. `weibo_light_pollution_high_recall_prefecture_plus_typed.json` with a `type` column). You can skip Stage 1 and run `run_pipeline.py` directly. Use `classify_weibo_qwen.py` only when you have **new, unlabeled** NDJSON or want to **re-label** from scratch.
-
-The rest of this document focuses on **Stage 2** in **Plan mode** (`--verifier-mode plan`): system prompts, per-module user prompts, Verifier Plan-and-Solve, and Judge Reflection adjudication.
+**Most users can start at Stage 2.** We provide `weibo_light_pollution_high_recall_prefecture_plus_typed.json` with Qwen `type` labels already filled in.
 
 ---
 
-## 1. Design Goals
+## 1. Quick Start
+
+```bash
+cd Agent_classifier
+# Configure API keys in .env (see Section 14)
+```
+
+### Stage 1 — Qwen initial labeling (optional)
+
+Only needed for **new, unlabeled** NDJSON. Writes a numeric `type` field (0–6) per record via DashScope/Qwen.
+
+```bash
+# Full run (supports --resume for interrupted jobs)
+python classify_weibo_qwen.py \
+  --input weibo_light_pollution_high_recall_prefecture_plus.json \
+  --output weibo_light_pollution_high_recall_prefecture_plus_typed.json \
+  --model qwen-plus \
+  --batch-size 200 \
+  --resume
+
+# Quick test on 100 records
+python classify_weibo_qwen.py \
+  --input weibo_light_pollution_high_recall_prefecture_plus.json \
+  --output test_typed.json \
+  --limit 100
+```
+
+> **Note:** We only ship `weibo_light_pollution_high_recall_prefecture_plus_typed.json` (with Qwen `type` labels). The Stage 1 example uses `weibo_light_pollution_high_recall_prefecture_plus.json` as a placeholder for the **untyped** input — you can derive it by removing the `type` field from each record in the typed file, then run `classify_weibo_qwen.py` for initial labeling. **The core of this repo is Stage 2:** multi-agent cross-validation of labels using **Plan-and-Solve** (Verifier) and **Reflection** (Judge) paradigms.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | `weibo_light_pollution_high_recall_prefecture_plus.json` | Input NDJSON |
+| `--output` | `<input_stem>_typed.json` | Output NDJSON with `type` |
+| `--api-key` | — | DashScope API key (or set `QWEN_API_KEY`) |
+| `--model` | `qwen-plus` | Qwen model name |
+| `--batch-size` | `20` | Records per API call |
+| `--resume` | off | Skip rows already written to output |
+| `--limit` | none | Process only the first N records (testing) |
+
+### Stage 2 — Multi-agent cross-validation (core)
+
+Reads existing `type` as `type_qwen`, runs independent Verifier + optional Judge, outputs `type_final`, `confidence`, and `needs_manual_review`. Does **not** call Qwen unless you pass `--no-reuse-qwen-type`.
+
+```bash
+# Default smoke test (10 records)
+python run_pipeline.py \
+  --input weibo_light_pollution_high_recall_prefecture_plus_typed.json \
+  --output weibo_pipeline_verified.json \
+  --limit 10
+
+# Plan-and-Solve verifier + judge on disagreement
+python run_pipeline.py \
+  --input weibo_light_pollution_high_recall_prefecture_plus_typed.json \
+  --output weibo_pipeline_verified.json \
+  --verifier-mode plan \
+  --judge-policy disagree_only \
+  --limit 10
+
+# Random sample + stats (type_qwen vs type_final)
+python run_pipeline.py \
+  --input weibo_light_pollution_high_recall_prefecture_plus_typed.json \
+  --random-sample 100 \
+  --seed 42 \
+  --stats-output pipeline_stats.json \
+  --verifier-mode plan
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--verifier-mode plan` | `single` | `plan` = Plan-and-Solve; `single` = one-shot classification |
+| `--judge-policy disagree_only` | `disagree_only` | Run Judge only when Qwen ≠ Verifier |
+| `--judge-policy full` | — | Also run Judge on boundary / ambiguous pairs |
+| `--reuse-qwen-type` | `true` | Reuse input `type`; do not call Qwen again |
+
+**Estimated API calls (Plan mode, per record):** ~5 if Qwen = Verifier; ~7 if Judge is triggered (1 Plan + 4 Execute + Reflect + Decide).
+
+The sections below document design goals, label schema, architecture, prompts, and module details.
+
+---
+
+## 2. Design Goals
 
 For each Weibo post (`weibo_text`), the pipeline **does not re-run Qwen** by default. Instead it:
 
@@ -27,7 +107,7 @@ All three classification agents share the same label semantics (0–6 definition
 
 ---
 
-## 2. Label Schema (0–6)
+## 3. Label Schema (0–6)
 
 | Label | Meaning |
 |-------|---------|
@@ -39,11 +119,11 @@ All three classification agents share the same label semantics (0–6 definition
 | 5 | Insomnia — causes / consequences / emotional or functional impact |
 | 6 | Unrelated |
 
-Full definitions and priority rules live in `LABEL_DEFINITIONS_AND_RULES` inside `prompts/classification.py`.
+Full definitions and priority rules live in `LABEL_DEFINITIONS_AND_RULES` inside `agents/prompts/classification.py`.
 
 ---
 
-## 3. Overall Architecture
+## 4. Overall Architecture
 
 ```mermaid
 flowchart TD
@@ -60,7 +140,7 @@ flowchart TD
     H --> OUT["Output NDJSON<br/>type_final + confidence + ..."]
 ```
 
-### 3.1 Agent Roles
+### 4.1 Agent Roles
 
 | Agent | File | Calls LLM? | Role |
 |-------|------|------------|------|
@@ -70,7 +150,7 @@ flowchart TD
 | ClassificationJudge | `agents/ClassificationJudge.py` | Yes | Dispute adjudication (Reflection) |
 | ConfidenceScorer | `agents/ConfidenceScorer.py` | No | Confidence / manual review |
 
-### 3.2 End-to-End Workflow
+### 4.2 End-to-End Workflow
 
 ```mermaid
 flowchart LR
@@ -84,95 +164,6 @@ flowchart LR
 |-------|--------|-------|--------------|---------|
 | 1 (optional) | `classify_weibo_qwen.py` | NDJSON without `type` | `type` | Qwen initial label |
 | 2 (core) | `run_pipeline.py` | NDJSON with `type` | `type_final` (+ audit fields) | Multi-agent cross-validation |
-
----
-
-## 4. Running the Pipeline
-
-### 4.0 Stage 1 — Qwen initial labeling (`classify_weibo_qwen.py`)
-
-Use this script when input records **do not yet have** a `type` field, or when you want to regenerate Qwen labels on new data.
-
-It reads NDJSON (`weibo_text` per row), calls Qwen (DashScope-compatible API), and **appends** `"type": 0–6` to each JSON object. Label semantics match Section 2.
-
-```bash
-cd Agent_classifier
-
-# Full run (supports --resume for interrupted jobs)
-python classify_weibo_qwen.py \
-  --input weibo_light_pollution_high_recall_prefecture_plus.json \
-  --output weibo_light_pollution_high_recall_prefecture_plus_typed.json \
-  --model qwen-plus \
-  --batch-size 200 \
-  --resume
-
-# Quick validation on a small sample
-python classify_weibo_qwen.py \
-  --input weibo_light_pollution_high_recall_prefecture_plus.json \
-  --output test_typed.json \
-  --limit 100
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input` | `weibo_light_pollution_high_recall_prefecture_plus.json` | Input NDJSON |
-| `--output` | `<input_stem>_typed.json` | Output NDJSON with `type` |
-| `--api-key` | — | DashScope API key (or set `QWEN_API_KEY`) |
-| `--model` | `qwen-plus` | Qwen model name |
-| `--batch-size` | `20` | Records per API call |
-| `--resume` | off | Skip rows already written to output |
-| `--limit` | none | Process only the first N records (testing) |
-
-**Already labeled?** If your JSON already contains `type` (as in `weibo_light_pollution_high_recall_prefecture_plus_typed.json`), go straight to Stage 2 below — `run_pipeline.py` reads that field as `type_qwen` by default (`--reuse-qwen-type`).
-
-### 4.1 Stage 2 — Multi-agent cross-validation (`run_pipeline.py`)
-
-This is the **core** of the project: independent Verifier + agreement rules + optional Judge, producing `type_final`, `confidence`, and `needs_manual_review`. It does **not** call Qwen unless you pass `--no-reuse-qwen-type`.
-
-```bash
-cd Agent_classifier
-
-python run_pipeline.py \
-  --input weibo_light_pollution_high_recall_prefecture_plus_typed.json \
-  --output weibo_pipeline_verified.json \
-  --verifier-mode plan \
-  --judge-policy disagree_only \
-  --limit 10
-```
-
-Random sampling + statistics (`type_qwen` vs `type_final`):
-
-```bash
-python run_pipeline.py \
-  --input weibo_light_pollution_high_recall_prefecture_plus_typed.json \
-  --random-sample 100 \
-  --seed 42 \
-  --stats-output pipeline_stats.json \
-  --verifier-mode plan
-```
-
-### 4.2 Key CLI Flags (Stage 2)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--verifier-mode plan` | `single` | `plan` = Plan-and-Solve; `single` = one-shot classification |
-| `--judge-policy disagree_only` | `disagree_only` | Run Judge only when Qwen ≠ Verifier |
-| `--judge-policy full` | — | Also run Judge on boundary / ambiguous pairs |
-| `--reuse-qwen-type` | `true` | Reuse input `type`; do not call Qwen again |
-
-### 4.3 Estimated API Calls (Plan Mode)
-
-Assume a 4-step plan and Judge is triggered:
-
-| Stage | Calls |
-|-------|-------|
-| Verifier Plan | 1 |
-| Verifier Execute | 4 (varies with plan length) |
-| Judge Reflect | 1 |
-| Judge Decide | 1 |
-| **Total** | **~7 per record** |
-
-If Qwen = Verifier under `disagree_only`: **~5 per record** (no Judge).
 
 ---
 

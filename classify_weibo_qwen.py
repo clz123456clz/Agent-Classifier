@@ -131,8 +131,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-key",
-        default="<your-api-key>",
-        help="Qwen/DashScope API key. Prefer setting QWEN_API_KEY instead of passing it here.",
+        default=os.environ.get("QWEN_API_KEY"),
+        help="Qwen/DashScope API key (default: the QWEN_API_KEY environment variable).",
     )
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="OpenAI-compatible API URL.")
     parser.add_argument("--model", default="qwen-plus", help="Qwen model name.")

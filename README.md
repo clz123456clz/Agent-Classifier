@@ -7,7 +7,25 @@ Two-stage Weibo text classifier (labels 0–6):
 | 1 (optional) | `classify_weibo_qwen.py` | Raw NDJSON without `type` — calls Qwen to write initial labels |
 | 2 (core) | `run_pipeline.py` | NDJSON with `type` — multi-agent cross-validation → `type_final` |
 
-**Most users can start at Stage 2.** We provide `weibo_light_pollution_high_recall_prefecture_plus_typed.json` with Qwen `type` labels already filled in.
+**Most users can start at Stage 2.** The labelled dataset is on Figshare (<https://doi.org/10.6084/m9.figshare.32526483>). Its `type` field already holds the Qwen labels, so Stage 2 runs on it directly. See [Data](#data) for the released files and [Reproducing the validation files](#reproducing-the-validation-files) for how the two CSV files were made.
+
+---
+
+## Data
+
+The dataset is deposited on Figshare under CC BY 4.0: <https://doi.org/10.6084/m9.figshare.32526483>. The DOI resolves to the latest version. Data files are not stored in this repository.
+
+| File | Contents |
+|------|----------|
+| `weibo_light_pollution_high_recall_prefecture_plus_typed.json` | 164,691 geotagged Weibo posts in JSON Lines (NDJSON), one post per line, about 103 MB. Eight fields: `_id`, `user_id` (keyed pseudonym), `create_time` (Beijing Time), `weibo_text` (identifiers masked), `city`, `gender`, `reposts_count` and `type` (Qwen label, 0–6). |
+| `validation_sample_labels.csv` | The random sample of 1,000 records checked with this pipeline: `sample_index`, `_id`, `type_qwen`, `type_verifier`, `type_final`, `judge_reviewed`. |
+| `reference_sample_labels.csv` | A sample of 1,000 released posts stratified by category (about 143 per category), labelled by two stronger models: `sample_index`, `_id`, `type_qwen`, `type_gpt_5.5_2026_04_23`, `type_gpt_5.4_2026_03_05`. |
+
+Both CSV files are keyed to `_id` in the JSON file. The `type` field holds the Stage 1 label from `qwen-plus`. Labels from the cross-validation were not written back into it; they are given in the two CSV files.
+
+The pipeline reads only `_id`, `weibo_text` and `type`, so the released file can be passed to `run_pipeline.py` unchanged. In `weibo_text`, e-mail addresses, telephone numbers, account handles, @-mentions, the poster's own screen name and check-in places are replaced by placeholders such as `[PHONE]`, `@[USER]` and `[PLACE]`. The released labels were assigned to the unmasked text, so labels produced again from the masked text may differ for a few posts.
+
+Please do not try to identify or contact users, and report results as totals or averages over many posts. The Data Descriptor gives the full guidance on responsible use.
 
 ---
 
@@ -38,7 +56,7 @@ python classify_weibo_qwen.py \
   --limit 100
 ```
 
-> **Note:** We only ship `weibo_light_pollution_high_recall_prefecture_plus_typed.json` (with Qwen `type` labels). The Stage 1 example uses `weibo_light_pollution_high_recall_prefecture_plus.json` as a placeholder for the **untyped** input — you can derive it by removing the `type` field from each record in the typed file, then run `classify_weibo_qwen.py` for initial labeling. **The core of this repo is Stage 2:** multi-agent cross-validation of labels using **Plan-and-Solve** (Verifier) and **Reflection** (Judge) paradigms.
+> **Note:** We only release `weibo_light_pollution_high_recall_prefecture_plus_typed.json` (with Qwen `type` labels; see [Data](#data)). The released labels were produced with `--model qwen-plus --batch-size 200`. The Stage 1 example uses `weibo_light_pollution_high_recall_prefecture_plus.json` as a placeholder for the **untyped** input — you can derive it by removing the `type` field from each record in the typed file, then run `classify_weibo_qwen.py` for initial labeling. **The core of this repo is Stage 2:** multi-agent cross-validation of labels using **Plan-and-Solve** (Verifier) and **Reflection** (Judge) paradigms.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -87,6 +105,54 @@ python run_pipeline.py \
 
 **Estimated API calls (Plan mode, per record):** ~5 if Qwen = Verifier; ~7 if Judge is triggered (1 Plan + 4 Execute + Reflect + Decide).
 
+---
+
+## Reproducing the validation files
+
+The Data Descriptor reports two checks of the released labels. Both can be re-run from the Figshare files.
+
+### Random sample (`validation_sample_labels.csv`)
+
+The sample was drawn with `run_pipeline.py --random-sample 1000 --seed 42` from all 242,137 labelled records, before duplicate copies of posts were removed. Each sampled record was then matched to its post in the released file; two sampled records were copies of the same post, so the file lists 999 distinct `_id` values. Running `--random-sample` on the released file draws a different sample. To re-run the Verifier and Judge on the same posts, select them by `_id`:
+
+```python
+import csv, json
+ids = {r["_id"] for r in csv.DictReader(open("validation_sample_labels.csv", encoding="utf-8"))}
+with open("weibo_light_pollution_high_recall_prefecture_plus_typed.json", encoding="utf-8") as src, \
+     open("validation_sample.json", "w", encoding="utf-8") as out:
+    for line in src:
+        if json.loads(line)["_id"] in ids:
+            out.write(line)
+```
+
+```bash
+python run_pipeline.py \
+  --input validation_sample.json \
+  --output validation_sample_verified.json \
+  --verifier-mode plan \
+  --judge-policy disagree_only
+```
+
+The published labels used `gpt-5.4-mini` as both Verifier and Judge (see [Environment Variables](#14-environment-variables)). Hosted models can change between runs and snapshots, so expect labels close to the published ones rather than identical.
+
+### Stratified sample (`reference_sample_labels.csv`)
+
+`draw_reference_sample.py` draws the sample from the released file, with about 143 posts per category and seed 43. It reproduces the published `_id` list exactly, in the same order, and also writes each post's sampling weight (posts in its category divided by posts sampled from it), which is needed to weight agreement back to the whole dataset. `label_reference_sample.py` then sends each post to a reference model with the same category instructions as Stage 1, one post per request, without the Qwen label.
+
+```bash
+python draw_reference_sample.py \
+  --release weibo_light_pollution_high_recall_prefecture_plus_typed.json \
+  --out reference_sample_stratified.jsonl
+
+export OPENAI_API_KEY="..."
+python label_reference_sample.py --input reference_sample_stratified.jsonl --model gpt-5.5
+python label_reference_sample.py --input reference_sample_stratified.jsonl --model gpt-5.4
+```
+
+Each run writes a JSON Lines file with the model's label in `type_ref`. The published labels came from the 2026-04-23 snapshot of `gpt-5.5` and the 2026-03-05 snapshot of `gpt-5.4`; pass a snapshot name as `--model` to use a fixed version.
+
+---
+
 The sections below document design goals, label schema, architecture, prompts, and module details.
 
 ---
@@ -109,17 +175,17 @@ All three classification agents share the same label semantics (0–6 definition
 
 ## 3. Label Schema (0–6)
 
-| Label | Meaning |
-|-------|---------|
-| 0 | Light pollution — direct complaint or harm |
-| 1 | Light pollution — urban night-light scene / strong artificial illumination |
-| 2 | Light pollution — governance / technology / ecology / measurement / astronomy |
-| 3 | Insomnia — direct self-reported sleeplessness |
-| 4 | Insomnia — chronic / clinical / treatment / help-seeking |
-| 5 | Insomnia — causes / consequences / emotional or functional impact |
-| 6 | Unrelated |
+| Label | Theme | Category |
+|-------|-------|----------|
+| 0 | Light | Direct light complaint or harm |
+| 1 | Light | Urban night illumination |
+| 2 | Light | Light policy, technology, ecology, or astronomy |
+| 3 | Sleep | Direct insomnia or unable to sleep |
+| 4 | Sleep | Chronic sleep disorder, treatment, or help-seeking |
+| 5 | Sleep | Causes or impacts of poor sleep |
+| 6 | Unrelated | Unrelated keyword noise |
 
-Full definitions and priority rules live in `LABEL_DEFINITIONS_AND_RULES` inside `agents/prompts/classification.py`.
+Category names follow the Data Descriptor. Full definitions and priority rules live in `LABEL_DEFINITIONS_AND_RULES` inside `agents/prompts/classification.py`; the prompts are kept exactly as they were run, and there the two themes are called "light pollution" and "insomnia".
 
 ---
 
@@ -507,9 +573,11 @@ type_final = 3
 Agent_classifier/
 ├── README.md                    ← this document
 ├── run_pipeline.py              ← CLI entry point
-├── classify_weibo_qwen.py       ← legacy Qwen batch labeling
-├── .env
-├── .gitignore
+├── classify_weibo_qwen.py       ← Stage 1 Qwen batch labeling
+├── draw_reference_sample.py     ← stratified reference sample (seed 43)
+├── label_reference_sample.py    ← reference-model labels for that sample
+├── .env.example                 ← copy to .env and add your keys
+├── .gitignore                   ← ignores .env and data files
 ├── *.json                       ← input/output data (gitignored)
 └── agents/                      ← core multi-agent modules
     ├── __init__.py
@@ -533,7 +601,7 @@ Agent_classifier/
 
 ## 14. Environment Variables
 
-Configure in `Agent_classifier/.env`:
+Copy `.env.example` to `.env` and fill in your keys. `.env` is listed in `.gitignore`, so keys stay out of the repository. `run_pipeline.py` reads it:
 
 ```env
 VERIFIER_MODEL_ID="gpt-5.4-mini"
@@ -546,3 +614,11 @@ JUDGE_BASE_URL="https://api.openai.com/v1"
 ```
 
 Verifier and Judge may share the same API account; `Language_Agent` shares rate-limit state across clients on the same key.
+
+`classify_weibo_qwen.py` reads `QWEN_API_KEY` and `label_reference_sample.py` reads `OPENAI_API_KEY` from the environment.
+
+---
+
+## Citation
+
+If you use the data or code, please cite the Figshare record (<https://doi.org/10.6084/m9.figshare.32526483>) and the Data Descriptor "An LLM-Labelled Weibo Dataset of Nighttime Lighting and Sleep-Related Expressions in China" (under review).
